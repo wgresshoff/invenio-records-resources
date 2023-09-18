@@ -40,6 +40,15 @@ class TransferType(str, Enum):
         """Return its value."""
         return self.value
 
+    @property
+    def is_completed(self):
+        """Return if the type represents a completed transfer."""
+        return self in [TransferType.LOCAL, TransferType.REMOTE]
+
+    def is_serializable(self):
+        """Return if the type represents a localy available file."""
+        return self != TransferType.LOCAL
+
 
 class BaseTransfer(ABC):
     """Local transfer."""
@@ -53,7 +62,7 @@ class BaseTransfer(ABC):
     @abstractmethod
     def init_file(self, record, file_metadata):
         """Initialize a file."""
-        pass
+        raise NotImplementedError()
 
     def set_file_content(self, record, file, file_key, stream, content_length):
         """Set file content."""

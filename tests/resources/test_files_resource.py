@@ -9,8 +9,9 @@
 # details.
 
 """Invenio Resources module to create REST APIs."""
-
+import zipfile
 from io import BytesIO
+from unittest.mock import patch
 
 import pytest
 from mock_module.config import ServiceWithFilesConfig
@@ -19,6 +20,7 @@ from mock_module.resource import (
     CustomFileResourceConfig,
     CustomRecordResourceConfig,
 )
+from zipstream import ZipStream
 
 from invenio_records_resources.resources import FileResource, RecordResource
 from invenio_records_resources.services import RecordService
@@ -158,6 +160,52 @@ def test_files_api_flow(client, search_clear, headers, input_data, location):
     res = client.get(f"/mocks/{id_}/files", headers=headers)
     assert res.status_code == 200
     assert len(res.json["entries"]) == 0
+
+
+def test_empty_file(client, search_clear, headers, input_data, location):
+    """Test if an empty file works properly."""
+    # Initialize a draft
+    res = client.post("/mocks", headers=headers, json=input_data)
+    assert res.status_code == 201
+    id_ = res.json["id"]
+    assert res.json["links"]["files"].endswith(f"/api/mocks/{id_}/files")
+
+    # Initialize files upload
+    res = client.post(
+        f"/mocks/{id_}/files",
+        headers=headers,
+        json=[
+            {"key": "empty", "title": "Zero-length test file"},
+        ],
+    )
+    assert res.status_code == 201
+
+    # Upload the empty file
+    res = client.put(
+        f"/mocks/{id_}/files/empty/content",
+        headers={
+            "content-type": "application/octet-stream",
+            "accept": "application/json",
+        },
+        data=BytesIO(b""),
+    )
+    assert res.status_code == 200
+
+    # Commit the uploaded file
+    res = client.post(f"/mocks/{id_}/files/empty/commit", headers=headers)
+    assert res.status_code == 200
+
+    # Get the file metadata, check if everything (especially size) is present
+    res = client.get(f"/mocks/{id_}/files/empty", headers=headers)
+    assert res.status_code == 200
+    assert res.json["key"] == "empty"
+    assert res.json["checksum"] == "md5:d41d8cd98f00b204e9800998ecf8427e"
+    assert res.json["size"] == 0
+
+    # Read a file's content
+    res = client.get(f"/mocks/{id_}/files/empty/content", headers=headers)
+    assert res.status_code == 200
+    assert res.data == b""
 
 
 def test_default_preview_file(app, client, search_clear, headers, input_data, location):
@@ -361,3 +409,78 @@ def test_disable_files_when_files_already_present_should_error(
             ],
         }
     ]
+
+
+def test_download_archive(
+    app,
+    client,
+    search_clear,
+    headers,
+    input_data,
+    location,
+):
+    # Initialize a draft
+    res = client.post("/mocks", headers=headers, json=input_data)
+    assert res.status_code == 201
+    id_ = res.json["id"]
+    assert res.json["links"]["files"].endswith(f"/api/mocks/{id_}/files")
+
+    # Initialize 3 file uploads
+    res = client.post(
+        f"/mocks/{id_}/files",
+        headers=headers,
+        json=[
+            {"key": "f1.pdf"},
+            {"key": "f2.pdf"},
+            {"key": "f3.pdf"},
+        ],
+    )
+    assert res.status_code == 201
+    file_entries = res.json["entries"]
+    assert len(file_entries) == 3
+    assert {(f["key"], f["status"]) for f in file_entries} == {
+        ("f1.pdf", "pending"),
+        ("f2.pdf", "pending"),
+        ("f3.pdf", "pending"),
+    }
+
+    # Upload and commit the 3 files
+    for f in file_entries:
+        res = client.put(
+            f"/mocks/{id_}/files/{f['key']}/content",
+            headers={
+                "content-type": "application/octet-stream",
+                "accept": "application/json",
+            },
+            data=BytesIO(b"testfile"),
+        )
+        assert res.status_code == 200
+        assert res.json["status"] == "pending"
+
+        res = client.post(f"/mocks/{id_}/files/{f['key']}/commit", headers=headers)
+        assert res.status_code == 200
+        assert res.json["status"] == "completed"
+
+    captured_fps = []
+
+    class MockZipStream(ZipStream):
+        def add(self, fp, *args, **kwargs):
+            # Keep track of all passed file pointers
+            captured_fps.append(fp)
+            return super().add(fp, *args, **kwargs)
+
+    # Get all files as zipped archive
+    with patch(
+        "invenio_records_resources.resources.files.resource.ZipStream",
+        new=MockZipStream,
+    ):
+        res = client.get(
+            f"/mocks/{id_}/files-archive",
+        )
+        assert res.status_code == 200
+        res_bytes = BytesIO(res.data)
+        with zipfile.ZipFile(res_bytes, "r") as zf:
+            files = zf.namelist()
+            files.sort()
+            assert files == ["f1.pdf", "f2.pdf", "f3.pdf"]
+    assert all(f.closed for f in captured_fps)

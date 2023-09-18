@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 #
 # This file is part of Invenio.
-# Copyright (C) 2020 CERN.
+# Copyright (C) 2020-2023 CERN.
 # Copyright (C) 2020 Northwestern University.
 #
 # Invenio-Records-Resources is free software; you can redistribute it and/or
@@ -38,9 +38,7 @@ class RecordTypeFactory(object):
     service_config_cls = None
     service_cls = None
 
-    _schema_path_template = (
-        "https://localhost/schemas/{name_plural}/{name}-v{version}.json"
-    )
+    _schema_path_template = "local://{name_plural}/{name}-v{version}.json"
     _index_name_template = "{name_plural}-{name}-v{version}"
 
     def __init__(

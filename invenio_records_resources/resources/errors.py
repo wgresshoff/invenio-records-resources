@@ -2,6 +2,7 @@
 #
 # Copyright (C) 2020 CERN.
 # Copyright (C) 2020 Northwestern University
+# Copyright (C) 2023 Graz University of Technology.
 #
 # Invenio-Records-Resources is free software; you can redistribute it and/or
 # modify it under the terms of the MIT License; see LICENSE file for more
@@ -12,8 +13,8 @@ from json import JSONDecodeError
 
 import marshmallow as ma
 from flask import jsonify, make_response, request, url_for
-from flask_babelex import lazy_gettext as _
 from flask_resources import HTTPJSONException, create_error_handler
+from invenio_i18n import lazy_gettext as _
 from invenio_pidstore.errors import (
     PIDAlreadyExists,
     PIDDeletedError,
@@ -31,6 +32,8 @@ from werkzeug.routing import BuildError
 
 from ..errors import validation_error_to_list_errors
 from ..services.errors import (
+    FacetNotFoundError,
+    FileKeyNotFoundError,
     PermissionDeniedError,
     QuerystringValidationError,
     RevisionIdMismatchError,
@@ -148,6 +151,18 @@ class ErrorHandlersMixin:
             HTTPJSONException(
                 code=404,
                 description="Not found.",
+            )
+        ),
+        FacetNotFoundError: create_error_handler(
+            lambda e: HTTPJSONException(
+                code=404,
+                description=f"Facet {e.vocabulary_id} not found.",
+            )
+        ),
+        FileKeyNotFoundError: create_error_handler(
+            lambda e: HTTPJSONException(
+                code=404,
+                description=str(e),
             )
         ),
         JSONDecodeError: create_error_handler(

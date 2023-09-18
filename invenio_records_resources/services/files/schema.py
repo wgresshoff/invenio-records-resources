@@ -25,6 +25,8 @@ from marshmallow import (
 from marshmallow.fields import UUID, Dict, Integer, Str
 from marshmallow_utils.fields import GenMethod, Links, SanitizedUnicode, TZDateTime
 
+from .transfer import TransferType
+
 
 class InitFileSchema(Schema):
     """Service (component) schema for file initialization.
@@ -83,13 +85,17 @@ class InitFileSchema(Schema):
         if data.file:
             # mandatory fields
             data["storage_class"] = data.file.storage_class
-            data["uri"] = data.file.uri  # TODO: only serialize for external?
+            data["uri"] = data.file.uri
+
+            # If Local -> remove uri as it contains internal file storage info
+            if not TransferType(data["storage_class"]).is_serializable():
+                data.pop("uri")
 
             # optional fields
             fields = ["checksum", "size"]
             for field in fields:
                 value = getattr(data.file, field, None)
-                if value:
+                if value is not None:
                     data[field] = value
 
         return data
@@ -117,5 +123,12 @@ class FileSchema(InitFileSchema):
 
     def dump_status(self, obj):
         """Dump file status."""
-        # TODO: check if storage class is external
-        return "completed" if obj.file else "pending"
+        # due to time constraints the status check is done here
+        # however, ideally this class should not need knowledge of
+        # the TransferType class, it should be encapsulated at File
+        # wrapper class or lower.
+        has_file = obj.file is not None
+        if has_file and TransferType(obj.file.storage_class).is_completed:
+            return "completed"
+
+        return "pending"

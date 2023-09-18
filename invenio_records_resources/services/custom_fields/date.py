@@ -16,13 +16,14 @@ from marshmallow import fields
 from marshmallow_utils.fields import EDTFDateString, ISODateString
 from pytz import utc
 
-from .base import BaseListCF
+from .base import BaseListCF, ensure_no_field_cls
 from .mappings import EDTFMapping, ISODateMapping
 
 
 class ISODateStringCF(BaseListCF):
     """ISO date custom field."""
 
+    @ensure_no_field_cls
     def __init__(self, name, **kwargs):
         """Constructor."""
         super().__init__(name, field_cls=ISODateString, **kwargs)
@@ -36,6 +37,7 @@ class ISODateStringCF(BaseListCF):
 class EDTFDateStringCF(BaseListCF):
     """EDTF date custom field."""
 
+    @ensure_no_field_cls
     def __init__(self, name, **kwargs):
         """Constructor."""
         super().__init__(name, field_cls=EDTFDateString, **kwargs)
@@ -86,7 +88,7 @@ class EDTFDateStringCF(BaseListCF):
                 else:
                     # dates is just one date
                     data[cf_key][self.name] = self._calculate_date_range(dates)
-            except (EDTFParseException):
+            except EDTFParseException:
                 pass
 
     def load(self, record, cf_key="custom_fields"):

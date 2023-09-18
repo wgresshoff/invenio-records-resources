@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 #
 # This file is part of Invenio.
-# Copyright (C) 2020-2022 CERN.
+# Copyright (C) 2020-2023 CERN.
 # Copyright (C) 2020 Northwestern University.
 #
 # Invenio-Records-Resources is free software; you can redistribute it and/or
@@ -47,9 +47,7 @@ class Record(RecordBase):
     expires_at = ModelField()
 
     # System fields
-    schema = ConstantField(
-        "$schema", "http://localhost/schemas/records/record-v1.0.0.json"
-    )
+    schema = ConstantField("$schema", "local://records/record-v1.0.0.json")
 
     index = IndexField("records-record-v1.0.0", search_alias="records")
 

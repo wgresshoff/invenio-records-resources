@@ -11,24 +11,29 @@
 """Record Service API."""
 
 from flask import current_app
+from invenio_db import db
+from invenio_pidstore.errors import PIDDoesNotExistError
 from invenio_records_permissions.api import permission_filter
 from invenio_search import current_search_client
 from invenio_search.engine import dsl
 from kombu import Queue
 from werkzeug.local import LocalProxy
 
+from invenio_records_resources.services.errors import PermissionDeniedError
+
 from ..base import LinksTemplate, Service
 from ..errors import RevisionIdMismatchError
-from ..uow import RecordCommitOp, RecordDeleteOp, unit_of_work
+from ..uow import RecordCommitOp, RecordDeleteOp, RecordIndexOp, unit_of_work
 from .schema import ServiceSchemaWrapper
 
 
-class RecordService(Service):
-    """Record Service."""
+class RecordIndexerMixin:
+    """Mixin class to define record indexer.
 
-    #
-    # Low-level API
-    #
+    Can be mixed in RecordService classes with the corresponding
+    configuration attributes.
+    """
+
     @property
     def indexer(self):
         """Factory for creating an indexer instance."""
@@ -55,6 +60,14 @@ class RecordService(Service):
     def record_to_index(self, record):
         """Function used to map a record to an index."""
         return record.index._name
+
+
+class RecordService(Service, RecordIndexerMixin):
+    """Record Service."""
+
+    #
+    # Low-level API
+    #
 
     @property
     def schema(self):
@@ -109,6 +122,7 @@ class RecordService(Service):
         permission_action="read",
         preference=None,
         extra_filter=None,
+        versioning=True,
     ):
         """Instantiate a search class."""
         if permission_action:
@@ -132,9 +146,14 @@ class RecordService(Service):
             search
             # Avoid query bounce problem
             .with_preference_param(preference)
-            # Add document version to search response
-            .params(version=True)
         )
+
+        if versioning:
+            search = (
+                search
+                # Add document version to search response
+                .params(version=True)
+            )
 
         # Extras
         extras = {}
@@ -152,6 +171,7 @@ class RecordService(Service):
         preference=None,
         extra_filter=None,
         permission_action="read",
+        versioning=True,
     ):
         """Factory for creating a Search DSL instance."""
         search = self.create_search(
@@ -161,6 +181,7 @@ class RecordService(Service):
             permission_action=permission_action,
             preference=preference,
             extra_filter=extra_filter,
+            versioning=versioning,
         )
 
         # Run search args evaluator
@@ -179,6 +200,7 @@ class RecordService(Service):
         search_opts=None,
         extra_filter=None,
         permission_action="read",
+        versioning=True,
         **kwargs,
     ):
         """Create the search engine DSL."""
@@ -198,6 +220,7 @@ class RecordService(Service):
             preference=search_preference,
             extra_filter=extra_filter,
             permission_action=permission_action,
+            versioning=versioning,
         )
 
         # Run components
@@ -356,6 +379,15 @@ class RecordService(Service):
             expand=expand,
         )
 
+    def exists(self, identity, id_):
+        """Check if the record exists and user has permission."""
+        try:
+            record = self.record_cls.pid.resolve(id_)
+            self.require_permission(identity, "read", record=record)
+            return True
+        except (PIDDoesNotExistError, PermissionDeniedError):
+            return False
+
     def _read_many(
         self,
         identity,
@@ -366,6 +398,7 @@ class RecordService(Service):
         search_opts=None,
         extra_filter=None,
         preference=None,
+        sort=None,
         **kwargs,
     ):
         """Search for records matching the ids."""
@@ -378,6 +411,7 @@ class RecordService(Service):
             permission_action="search",
             preference=preference,
             extra_filter=extra_filter,
+            versioning=True,
         )
 
         # Fetch only certain fields - explicitly add internal system fields
@@ -391,8 +425,10 @@ class RecordService(Service):
             # method instead for now.
             search = search.source(fields)
 
-        search = search[0:max_records]
-        search_result = search.query(search_query).execute()
+        search = search[0:max_records].query(search_query)
+        if sort:
+            search = search.sort(sort)
+        search_result = search.execute()
 
         return search_result
 
@@ -405,7 +441,12 @@ class RecordService(Service):
 
         results = self._read_many(identity, query, fields, len(ids), **kwargs)
 
-        return self.result_list(self, identity, results)
+        return self.result_list(
+            self,
+            identity,
+            results,
+            links_item_tpl=self.links_item_tpl,
+        )
 
     def read_all(self, identity, fields, max_records=150, **kwargs):
         """Search for records matching the querystring."""
@@ -464,16 +505,34 @@ class RecordService(Service):
 
         Note: Skips (soft) deleted records.
         """
-        records = self.record_cls.model_cls.query.filter_by(is_deleted=False).all()
-        self.indexer.bulk_index([rec.id for rec in records])
+        model_cls = self.record_cls.model_cls
+        records = (
+            db.session.query(model_cls.id)
+            .filter(model_cls.is_deleted == False)
+            .yield_per(1000)
+        )
+
+        self.indexer.bulk_index((rec.id for rec in records))
 
         return True
 
     #
     # notification handlers
     #
-    def on_relation_update(self, identity, record_type, records_info, notif_time):
-        """Handles the update of a related field record."""
+    def on_relation_update(
+        self, identity, record_type, records_info, notif_time, limit=100
+    ):
+        """Handles the update of a related field record.
+
+        :param identity: the identity that will search and reindex.
+        :param record_type: the record type with relations.
+        :param records_info: a list of tuples containing (recid, uuid, revision_id)
+                             for each record to reindex.
+        :param notif_time: reindex records index before this time.
+        :param limit: reindex in chunks of these records. The limit must be lower than
+                      the search engine maxClauseCount setting.
+        :returns: True.
+        """
         fieldpaths = self.config.relations.get(record_type, [])
         clauses = []
         for field in fieldpaths:
@@ -490,9 +549,14 @@ class RecordService(Service):
                 )
 
         filter = [dsl.Q("range", indexed_at={"lte": notif_time})]
-        search_query = dsl.Q(
-            "bool", minimum_should_match=1, should=clauses, filter=filter
-        )
+        # split the list in chunks of `limit`, the last chunk will have the remaining
+        chunked_clauses = [
+            clauses[i : i + limit] for i in range(0, len(clauses), limit)
+        ]
+        for chunked_clause in chunked_clauses:
+            search_query = dsl.Q(
+                "bool", minimum_should_match=1, should=chunked_clause, filter=filter
+            )
 
-        self.reindex(identity, search_query=search_query)
+            self.reindex(identity, search_query=search_query)
         return True

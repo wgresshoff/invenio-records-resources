@@ -2,6 +2,7 @@
 #
 # Copyright (C) 2020 CERN.
 # Copyright (C) 2020 Northwestern University.
+# Copyright (C) 2023 TU Wien.
 #
 # Invenio-Records-Resources is free software; you can redistribute it and/or
 # modify it under the terms of the MIT License; see LICENSE file for more
@@ -9,8 +10,10 @@
 
 """Invenio Record File Resources."""
 
+from contextlib import ExitStack
+
 import marshmallow as ma
-from flask import abort, g
+from flask import Response, abort, current_app, g, stream_with_context
 from flask_resources import (
     JSONDeserializer,
     RequestBodyParser,
@@ -21,6 +24,8 @@ from flask_resources import (
     response_handler,
     route,
 )
+from invenio_stats.proxies import current_stats
+from zipstream import ZIP_STORED, ZipStream
 
 from ..errors import ErrorHandlersMixin
 from .parser import RequestStreamParser
@@ -58,11 +63,16 @@ class FileResource(ErrorHandlersMixin, Resource):
     def create_url_rules(self):
         """Routing for the views."""
         routes = self.config.routes
+
         url_rules = [
             route("GET", routes["list"], self.search),
             route("GET", routes["item"], self.read),
             route("GET", routes["item-content"], self.read_content),
         ]
+        if self.config.allow_archive_download:
+            url_rules += [
+                route("GET", routes["list-archive"], self.read_archive),
+            ]
         if self.config.allow_upload:
             url_rules += [
                 route("POST", routes["list"], self.create),
@@ -116,9 +126,6 @@ class FileResource(ErrorHandlersMixin, Resource):
             resource_requestctx.view_args["key"],
         )
 
-        if item is None:
-            abort(404)
-
         return item.to_dict(), 200
 
     @request_view_args
@@ -132,9 +139,6 @@ class FileResource(ErrorHandlersMixin, Resource):
             resource_requestctx.view_args["key"],
             resource_requestctx.data or {},
         )
-
-        if item is None:
-            abort(404)
 
         return item.to_dict(), 200
 
@@ -169,10 +173,44 @@ class FileResource(ErrorHandlersMixin, Resource):
             resource_requestctx.view_args["key"],
         )
 
-        if item is None:
-            abort(404)
+        # emit file download stats event
+        obj = item._file.object_version
+        emitter = current_stats.get_event_emitter("file-download")
+        if obj is not None and emitter is not None:
+            emitter(current_app, record=item._record, obj=obj, via_api=True)
 
         return item.send_file(), 200
+
+    @request_view_args
+    def read_archive(self):
+        """Read a zipped version of all files."""
+        id_ = resource_requestctx.view_args["pid_value"]
+        files = self.service.list_files(g.identity, id_)
+
+        # emit file download stats events for each file
+        emitter = current_stats.get_event_emitter("file-download")
+        for f in files._results:
+            obj = f.object_version
+            if obj is not None and emitter is not None:
+                emitter(current_app, record=files._record, obj=obj, via_api=True)
+
+        def _gen_zipstream():
+            """Generator for the streaming of the zipped file."""
+            zs = ZipStream(compress_type=ZIP_STORED)
+            with ExitStack() as stack:
+                for file_obj in files._results:
+                    fp = stack.enter_context(file_obj.open_stream("rb"))
+                    zs.add(fp, file_obj.key)
+                yield from zs.all_files()
+                yield from zs.finalize()
+
+        return Response(
+            stream_with_context(_gen_zipstream()),
+            mimetype="application/zip",
+            headers={
+                "Content-Disposition": f"attachment; filename={id_}.zip",
+            },
+        )
 
     @request_view_args
     @request_stream
@@ -187,8 +225,5 @@ class FileResource(ErrorHandlersMixin, Resource):
             resource_requestctx.data["request_stream"],
             content_length=resource_requestctx.data["request_content_length"],
         )
-
-        if item is None:
-            abort(404)
 
         return item.to_dict(), 200

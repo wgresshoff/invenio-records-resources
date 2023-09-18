@@ -45,6 +45,14 @@ mocked_other_service = MockedService(MOCK_NESTED)
 
 
 class CreatedByExpandableField(ExpandableField):
+    def ghost_record(self, value):
+        """Override default."""
+        return {}
+
+    def system_record(self):
+        """Override default."""
+        raise NotImplementedError()
+
     def get_value_service(self, value):
         """Override default."""
         if value.get("user"):
@@ -52,7 +60,7 @@ class CreatedByExpandableField(ExpandableField):
         elif value.get("entity"):
             return value["entity"], mocked_entity_service
 
-    def pick(self, resolved_rec):
+    def pick(self, identity, resolved_rec):
         """Override default."""
         if "profile" in resolved_rec:
             return {
@@ -67,11 +75,19 @@ class CreatedByExpandableField(ExpandableField):
 
 
 class SimpleExpandableField(ExpandableField):
+    def ghost_record(self, value):
+        """Override default."""
+        return {}
+
+    def system_record(self):
+        """Override default."""
+        raise NotImplementedError()
+
     def get_value_service(self, value):
         """Override default."""
         return value, mocked_simple_service
 
-    def pick(self, resolved_rec):
+    def pick(self, identity, resolved_rec):
         """Override default."""
         metadata = resolved_rec["metadata"]
         return {
@@ -81,11 +97,19 @@ class SimpleExpandableField(ExpandableField):
 
 
 class OtherExpandableField(ExpandableField):
+    def ghost_record(self, value):
+        """Override default."""
+        return {}
+
+    def system_record(self):
+        """Override default."""
+        raise NotImplementedError()
+
     def get_value_service(self, value):
         """Override default."""
         return value, mocked_other_service
 
-    def pick(self, resolved_rec):
+    def pick(self, identity, resolved_rec):
         """Override default."""
         metadata = resolved_rec["metadata"]
         return {
@@ -96,7 +120,6 @@ class OtherExpandableField(ExpandableField):
 
 
 def test_result_item_fields_expansion(app, db, service, identity_simple):
-
     input_data1 = {
         "metadata": {
             "title": "Test",

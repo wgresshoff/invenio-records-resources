@@ -10,10 +10,12 @@
 """Service results."""
 from abc import ABC, abstractmethod
 
+from invenio_access.permissions import system_user_id
 from invenio_records.dictutils import dict_lookup, dict_merge, dict_set
 
 from ...pagination import Pagination
 from ..base import ServiceItemResult, ServiceListResult
+from .schema import BaseGhostSchema
 
 
 class RecordItem(ServiceItemResult):
@@ -53,7 +55,7 @@ class RecordItem(ServiceItemResult):
     @property
     def links(self):
         """Get links for this result item."""
-        return self._links_tpl.expand(self._record)
+        return self._links_tpl.expand(self._identity, self._record)
 
     @property
     def _obj(self):
@@ -78,7 +80,7 @@ class RecordItem(ServiceItemResult):
 
         if self._expand and self._fields_resolver:
             self._fields_resolver.resolve(self._identity, [self._data])
-            fields = self._fields_resolver.expand(self._data)
+            fields = self._fields_resolver.expand(self._identity, self._data)
             self._data["expanded"] = fields
 
         return self._data
@@ -196,7 +198,9 @@ class RecordList(ServiceListResult):
                 ),
             )
             if self._links_item_tpl:
-                projection["links"] = self._links_item_tpl.expand(record)
+                projection["links"] = self._links_item_tpl.expand(
+                    self._identity, record
+                )
 
             yield projection
 
@@ -218,7 +222,7 @@ class RecordList(ServiceListResult):
         if self._expand and self._fields_resolver:
             self._fields_resolver.resolve(self._identity, hits)
             for hit in hits:
-                fields = self._fields_resolver.expand(hit)
+                fields = self._fields_resolver.expand(self._identity, hit)
                 hit["expanded"] = fields
 
         res = {
@@ -234,7 +238,7 @@ class RecordList(ServiceListResult):
         if self._params:
             res["sortBy"] = self._params["sort"]
             if self._links_tpl:
-                res["links"] = self._links_tpl.expand(self.pagination)
+                res["links"] = self._links_tpl.expand(self._identity, self.pagination)
 
         return res
 
@@ -259,8 +263,29 @@ class ExpandableField(ABC):
 
     @abstractmethod
     def get_value_service(self, value):
-        """Return the value and the service to fetch the referenced record."""
-        return None, None
+        """Return the value and the service to fetch the referenced record.
+
+        Example:
+            return (value, MyService())
+        """
+        raise NotImplementedError()
+
+    @abstractmethod
+    def ghost_record(self, value):
+        """Return the ghost representation of the unresolved value.
+
+        This is used when a value cannot be resolved. The returned value
+        will be available when the method `self.pick()` is called.
+        """
+        raise NotImplementedError()
+
+    @abstractmethod
+    def system_record(self):
+        """Return the representation of a system user.
+
+        This is used for the user with id = 'system'.
+        """
+        raise NotImplementedError()
 
     def has(self, service, value):
         """Return true if field has given value for given service."""
@@ -277,6 +302,12 @@ class ExpandableField(ABC):
 
     def add_dereferenced_record(self, service, value, resolved_rec):
         """Save the dereferenced record."""
+        # mark the record as a "ghost" or "system" record i.e not resolvable
+        if resolved_rec is None:
+            if value == system_user_id:
+                resolved_rec = self.system_record()
+            else:
+                resolved_rec = self.ghost_record({"id": value})
         self._service_values[service][value] = resolved_rec
 
     def get_dereferenced_record(self, service, value):
@@ -284,9 +315,9 @@ class ExpandableField(ABC):
         return self._service_values[service][value]
 
     @abstractmethod
-    def pick(self, resolved_rec):
+    def pick(self, identity, resolved_rec):
         """Pick the fields to return from the resolved record dict."""
-        return {"id": resolved_rec["id"]}
+        raise NotImplementedError()
 
 
 class FieldsResolver:
@@ -322,6 +353,8 @@ class FieldsResolver:
             for field in self._fields:
                 try:
                     value = dict_lookup(hit, field.field_name)
+                    if value is None:
+                        continue
                 except KeyError:
                     continue
                 else:
@@ -350,12 +383,28 @@ class FieldsResolver:
 
     def _fetch_referenced(self, grouped_values, identity):
         """Search and fetch referenced recs by ids."""
-        for service, values in grouped_values.items():
-            results = service.read_many(identity, list(values))
+
+        def _add_dereferenced_record(service, value, resolved_rec):
+            """Helper function to set the dereferenced record to the service."""
+            for field in self._find_fields(service, value):
+                field.add_dereferenced_record(service, value, resolved_rec)
+
+        for service, all_values in grouped_values.items():
+            results = service.read_many(identity, list(all_values))
+
+            found_values = set()
             for hit in results.hits:
                 value = hit.get("id", None)
-                for field in self._find_fields(service, value):
-                    field.add_dereferenced_record(service, value, hit)
+                # keep values visited so we can extract the ones not found i.e ghost
+                found_values.add(value)
+                _add_dereferenced_record(service, value, hit)
+
+            ghost_values = all_values - found_values
+            if ghost_values:
+                for value in ghost_values:
+                    # set dereferenced record to None. That will trigger eventually
+                    # the field.ghost_record() to be called
+                    _add_dereferenced_record(service, value, None)
 
     def resolve(self, identity, hits):
         """Collect field values and resolve referenced records."""
@@ -363,12 +412,14 @@ class FieldsResolver:
         grouped_values = self._collect_values(_hits)
         self._fetch_referenced(grouped_values, identity)
 
-    def expand(self, hit):
+    def expand(self, identity, hit):
         """Return the expanded fields for the given hit."""
         results = dict()
         for field in self._fields:
             try:
                 value = dict_lookup(hit, field.field_name)
+                if value is None:
+                    continue
             except KeyError:
                 continue
             else:
@@ -377,7 +428,7 @@ class FieldsResolver:
                 resolved_rec = field.get_dereferenced_record(service, v)
                 if not resolved_rec:
                     continue
-                output = field.pick(resolved_rec)
+                output = field.pick(identity, resolved_rec)
 
                 # transform field name (potentially dotted) to nested dicts
                 # to keep the nested structure of the field
